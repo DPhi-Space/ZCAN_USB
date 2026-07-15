@@ -4,7 +4,7 @@
  *
  * Supports: NXP USB CANFD DEBUG / Zhiyuan Electronics USBCANFD-200U
  * USB ID:   04d8:0053
- * Version:  0.5.1
+ * Version:  0.7.0
  *
  * This driver was completely reverse-engineered from USB traffic captures
  * and static analysis of the vendor library (libcontrolcanfd.a).
@@ -36,7 +36,7 @@
 #include <crypto/skcipher.h>
 #include <linux/scatterlist.h>
 
-#define DRIVER_VERSION	"0.5.1"
+#define DRIVER_VERSION	"0.7.0"
 #define DRIVER_NAME	"zcan_usb"
 
 #define ZCAN_VENDOR_ID		0x04d8
@@ -67,6 +67,26 @@
 #define CMD_TRANSMIT		0x8004	/* transmit CAN frame */
 #define CMD_RESET_CAN		0x8008	/* reset / stop channel */
 
+/*
+ * CMD_GET_STATUS - EXPERIMENTAL / UNVERIFIED.
+ *
+ * 0x800D comes from the DW_TAG_enumerator "CMD_GET_STATUS" found in the
+ * DWARF debug info of gvar.o (libcontrolcanfd.a), which also defines
+ * ZCAN_CHANNEL_STATUS/ZCAN_CHANNEL_ERR_INFO (regTECounter, regRECounter,
+ * bus-off etc.) - exactly the kind of real controller error state this
+ * device's netdev stats cannot provide (see zcan_netdev_xmit/zcan_tx_complete:
+ * tx_packets is incremented as soon as the USB URB is handed off, with no
+ * feedback on whether the frame was ever ACKed on the physical bus).
+ *
+ * However, the SAME enum's CMD_RESET_CAN = 0x8009 does NOT match the value
+ * verified for this actual device via live USB capture (0x8008, see
+ * zcan_reset_channel() below) - so this vendor lib build's command numbering
+ * does not reliably match this device's firmware one-to-one. Do not trust
+ * 0x800D until it has been cross-checked against a Wireshark/usbmon capture
+ * of this exact command being issued to this exact device.
+ */
+#define CMD_GET_STATUS		0x800d	/* UNVERIFIED, see comment above */
+
 /* USB endpoints */
 #define EP_CMD_OUT		0x01	/* commands + CH0 TX out */
 #define EP_CMD_IN		0x81	/* command responses in */
@@ -85,12 +105,22 @@
  *  [8..9]  = CAN ID, big-endian 16-bit
  *  [10]    = DLC
  *  [11..11+dlc-1] = data bytes
+ *  [20]    = channel index (0 or 1) - VERIFIED via usbmon capture of the
+ *            vendor library's own ZCAN_Transmit() (main_classic.cpp in
+ *            zcan_orig/, built against libcontrolcanfd.so): CH0 sends have
+ *            0x00 here, CH1 sends have 0x01, identical otherwise. This was
+ *            previously assumed to be byte[2] (wrong guess, never actually
+ *            verified) - with byte[20] always 0x00 in our own TX, every
+ *            frame was silently routed to channel 0 regardless of which
+ *            netdev/endpoint it was sent from, which is why CH1 TX never
+ *            reached the physical bus while CH0 TX always worked.
  *  [21]    = transmit_type (0x00 = normal with auto-retry)
  */
 #define TX_CAN_PAYLOAD_LEN	26
 #define TX_CAN_ID_OFFSET	8
 #define TX_CAN_DLC_OFFSET	10
 #define TX_CAN_DATA_OFFSET	11
+#define TX_CAN_CH_OFFSET	20
 #define TX_CAN_TXTYPE_OFFSET	21
 
 /* RX frame layout (raw, 21 bytes, no BEEF wrapper):
@@ -142,6 +172,15 @@ struct zcan_priv {
 	struct urb		*tx_urbs[ZCAN_MAX_CHANNELS];
 	u8			*tx_bufs[ZCAN_MAX_CHANNELS];
 	atomic_t		 tx_active[ZCAN_MAX_CHANNELS];
+
+	/*
+	 * Whether INIT_CAN/SET_BAUD/START_CAN has actually been sent to each
+	 * channel's hardware. Guards against re-initializing/re-starting a
+	 * channel that is already running as the "sibling" of the channel
+	 * currently being opened - see zcan_netdev_open(). Protected by
+	 * cmd_lock.
+	 */
+	bool			 ch_started[ZCAN_MAX_CHANNELS];
 
 	/* Command serialization (probe/open/close use blocking bulk_msg) */
 	struct mutex		 cmd_lock;
@@ -503,13 +542,18 @@ static int zcan_init_channel(struct zcan_priv *priv, int ch)
 	u8 resp[ZCAN_MAX_PKG_SIZE];
 	int resp_len = 0;
 
+	int ret;
+
 	data[18] = (dbit >> 24) & 0xff;
 	data[19] = (dbit >> 16) & 0xff;
 	data[20] = (dbit >>  8) & 0xff;
 	data[21] =  dbit        & 0xff;
 
-	return zcan_cmd(priv, CMD_INIT_CAN, data, sizeof(data),
+	ret = zcan_cmd(priv, CMD_INIT_CAN, data, sizeof(data),
 			resp, &resp_len);
+	dev_info(&priv->udev->dev, "INIT_CAN ch%d ret=%d resp(%d)=%*ph\n",
+		 ch, ret, resp_len, resp_len, resp);
+	return ret;
 }
 
 /*
@@ -524,9 +568,13 @@ static int zcan_set_baud(struct zcan_priv *priv, int ch, u32 bitrate)
 	};
 	u8 resp[ZCAN_MAX_PKG_SIZE];
 	int resp_len = 0;
+	int ret;
 
-	return zcan_cmd(priv, CMD_SET_BAUD, data, sizeof(data),
+	ret = zcan_cmd(priv, CMD_SET_BAUD, data, sizeof(data),
 			resp, &resp_len);
+	dev_info(&priv->udev->dev, "SET_BAUD ch%d ret=%d resp(%d)=%*ph\n",
+		 ch, ret, resp_len, resp_len, resp);
+	return ret;
 }
 
 /*
@@ -537,10 +585,101 @@ static int zcan_start_channel(struct zcan_priv *priv, int ch)
 	u8 data[4] = { 0x55, 0x80, 0x03, (u8)ch };
 	u8 resp[ZCAN_MAX_PKG_SIZE];
 	int resp_len = 0;
+	int ret;
 
-	return zcan_cmd(priv, CMD_START_CAN, data, sizeof(data),
+	ret = zcan_cmd(priv, CMD_START_CAN, data, sizeof(data),
+			resp, &resp_len);
+	dev_info(&priv->udev->dev, "START_CAN ch%d ret=%d resp(%d)=%*ph\n",
+		 ch, ret, resp_len, resp_len, resp);
+	return ret;
+}
+
+/*
+ * CMD_RESET_CAN (0x8008) - Stop / reset a CAN channel.
+ *
+ * Must be sent before a running channel's INIT_CAN/SET_BAUD/START_CAN
+ * can be safely resent - the firmware does not accept reconfiguration
+ * of an already-started channel.
+ */
+static int zcan_reset_channel(struct zcan_priv *priv, int ch)
+{
+	u8 data[4] = { 0x55, 0x80, 0x08, (u8)ch };
+	u8 resp[ZCAN_MAX_PKG_SIZE];
+	int resp_len = 0;
+
+	return zcan_cmd(priv, CMD_RESET_CAN, data, sizeof(data),
 			resp, &resp_len);
 }
+
+/*
+ * CMD_GET_STATUS (0x800D) - EXPERIMENTAL, see comment at the #define above.
+ *
+ * Payload follows the same convention already verified for START_CAN/
+ * RESET_CAN: [0]=0x55 magic, [1..2]=cmd big-endian, [3]=channel index.
+ * Whether the device actually understands this specific command, and what
+ * the response payload means, is unconfirmed - the caller is expected to
+ * cross-check the raw response against a simultaneous USB capture.
+ *
+ * NOTE: EP_CMD_OUT (0x01) is shared with CH0 TX frames (see
+ * zcan_netdev_xmit()). Querying status while CH0 is actively transmitting
+ * real CAN traffic can race with that traffic on the same endpoint - best
+ * used with CH0 idle, or against CH1.
+ */
+static int zcan_get_status(struct zcan_priv *priv, int ch,
+			    u8 *resp, int *resp_len)
+{
+	u8 data[4] = { 0x55, 0x80, 0x0d, (u8)ch };
+
+	return zcan_cmd(priv, CMD_GET_STATUS, data, sizeof(data),
+			 resp, resp_len);
+}
+
+/* -------------------------------------------------------------------------
+ * Diagnostics / sysfs
+ * -------------------------------------------------------------------------
+ * Read-only attributes that trigger a live CMD_GET_STATUS query on demand,
+ * so the raw response can be inspected (dmesg / sysfs) at the exact same
+ * time a Wireshark/usbmon capture is running, to confirm or refute whether
+ * 0x800D is a real, meaningful command for this device.
+ */
+static ssize_t zcan_status_show(struct device *dev, int ch, char *buf)
+{
+	struct usb_interface *intf = to_usb_interface(dev);
+	struct zcan_priv *priv = usb_get_intfdata(intf);
+	u8 resp[ZCAN_MAX_PKG_SIZE];
+	int resp_len = 0, ret, i, n = 0;
+
+	if (!priv)
+		return -ENODEV;
+
+	mutex_lock(&priv->cmd_lock);
+	ret = zcan_get_status(priv, ch, resp, &resp_len);
+	mutex_unlock(&priv->cmd_lock);
+
+	if (ret)
+		return scnprintf(buf, PAGE_SIZE, "cmd failed: %d\n", ret);
+
+	n = scnprintf(buf, PAGE_SIZE, "len=%d data=", resp_len);
+	for (i = 0; i < resp_len && n < PAGE_SIZE - 3; i++)
+		n += scnprintf(buf + n, PAGE_SIZE - n, "%02x ", resp[i]);
+	n += scnprintf(buf + n, PAGE_SIZE - n, "\n");
+	return n;
+}
+
+static ssize_t status_ch0_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	return zcan_status_show(dev, 0, buf);
+}
+
+static ssize_t status_ch1_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	return zcan_status_show(dev, 1, buf);
+}
+
+static DEVICE_ATTR_RO(status_ch0);
+static DEVICE_ATTR_RO(status_ch1);
 
 /* -------------------------------------------------------------------------
  * RX path
@@ -670,9 +809,25 @@ static void zcan_tx_complete(struct urb *urb)
  *  [8..9]  = CAN ID, big-endian 16-bit (11-bit SFF)
  *  [10]    = DLC (0..8)
  *  [11..11+dlc-1] = data
+ *  [20]    = channel index (0 or 1)
  *  [21]    = transmit_type = 0x00 (normal, auto-retry on error)
  *
- * Channel routing: CH0 → EP1 OUT, CH1 → EP2 OUT
+ * Channel routing: CH0 -> EP1 OUT, CH1 -> EP2 OUT (endpoint), AND the
+ * channel index at byte[20] (both matter, not just the endpoint).
+ *
+ * ROOT CAUSE (found and fixed): byte[20] was always 0x00 (i.e. "channel 0")
+ * regardless of which channel actually transmitted - it used to be treated
+ * as unused padding. VERIFIED via usbmon capture of the vendor library's
+ * own ZCAN_Transmit() (see zcan_orig/main_classic.cpp, a modified copy of
+ * the reference demo using the classic, non-FD transmit call): CH0 sends
+ * have 0x00 at byte[20], CH1 sends have 0x01, byte-identical otherwise.
+ * With byte[20] always 0, every TX from this driver was silently routed to
+ * CH0's physical transceiver regardless of source endpoint - the USB
+ * transfer itself always succeeded (status 0), so nothing ever surfaced
+ * this as an error. This is why CH0->CH1 sends were visible on the bus but
+ * CH1->CH0 sends never were, confirmed by the vendor demo's CH1 LEDs/bus
+ * traffic only appearing once the classic ZCAN_Transmit() call (which sets
+ * this byte correctly) was used instead of this driver's old code.
  */
 static netdev_tx_t zcan_netdev_xmit(struct sk_buff *skb,
 				    struct net_device *netdev)
@@ -695,6 +850,7 @@ static netdev_tx_t zcan_netdev_xmit(struct sk_buff *skb,
 	memset(tx_data, 0, sizeof(tx_data));
 	tx_data[0] = MAGIC_INIT;	/* 0x55 */
 	tx_data[1] = TX_TYPE_CAN;	/* 0xF1 */
+	tx_data[TX_CAN_CH_OFFSET] = (u8)ch_idx;	/* verified fix, see comment above */
 
 	if (can_is_canfd_skb(skb)) {
 		struct canfd_frame *cf = (struct canfd_frame *)skb->data;
@@ -752,9 +908,25 @@ static netdev_tx_t zcan_netdev_xmit(struct sk_buff *skb,
  * (verified from USB captures):
  *   INIT CH0 → INIT CH1 → BAUD CH0 → START CH0 → BAUD CH1 → START CH1
  *
- * Both channels must be initialized even when only one is used.
- * Without CH1 init, EP3 stays silent and the device stops delivering
- * RX frames after a TX is performed.
+ * Both channels must be initialized even when only one is used, since
+ * without CH1 init, EP3 stays silent and the device stops delivering
+ * RX frames after a TX is performed. However, this sibling-channel
+ * setup must only happen once: if the sibling is already running
+ * (opened independently, e.g. "ip link set can0 up" followed later by
+ * "ip link set can1 up"), re-sending INIT/BAUD/START to it here would
+ * silently reset its bitrate to the hardcoded default and restart an
+ * already-active channel without a prior CMD_RESET_CAN, which the
+ * firmware does not handle cleanly - this was observed to leave the
+ * sibling channel stuck receiving nothing.
+ *
+ * BUGFIX: the exact same hazard applies to THIS channel, not just the
+ * sibling - if it was already started as the *other* netdev's sibling
+ * (e.g. "ifconfig can0 up" already started ch1 as its sibling, and
+ * "ifconfig can1 up" runs afterwards), re-running INIT/BAUD/START here
+ * unconditionally re-triggers the same "no prior CMD_RESET_CAN" failure
+ * mode on THIS channel. This was the actual cause of CH1 TX silently
+ * not reaching the physical bus while CH0 TX worked fine: whichever
+ * channel's netdev was brought up *second* got double-initialized.
  */
 static int zcan_netdev_open(struct net_device *netdev)
 {
@@ -770,16 +942,21 @@ static int zcan_netdev_open(struct net_device *netdev)
 
 	mutex_lock(&priv->cmd_lock);
 
-	/* INIT both channels */
+	if (priv->ch_started[ch->channel_idx])
+		goto already_started;
+
+	/* INIT this channel, and the sibling too if it isn't already
+	 * running - but never re-init an already-started sibling. */
 	ret = zcan_init_channel(priv, ch->channel_idx);
 	if (ret) {
 		dev_err(&priv->udev->dev, "INIT_CAN ch%d failed: %d\n",
 			ch->channel_idx, ret);
 		goto out;
 	}
-	zcan_init_channel(priv, other); /* non-fatal */
+	if (!priv->ch_started[other])
+		zcan_init_channel(priv, other); /* non-fatal */
 
-	/* BAUD + START main channel */
+	/* BAUD + START this channel */
 	ret = zcan_set_baud(priv, ch->channel_idx, baud);
 	if (ret) {
 		dev_err(&priv->udev->dev, "SET_BAUD ch%d failed: %d\n",
@@ -792,11 +969,22 @@ static int zcan_netdev_open(struct net_device *netdev)
 			ch->channel_idx, ret);
 		goto out;
 	}
+	priv->ch_started[ch->channel_idx] = true;
 
-	/* BAUD + START other channel (non-fatal, needed for stable RX) */
-	zcan_set_baud(priv, other, 500000);
-	zcan_start_channel(priv, other);
+	/* BAUD + START the sibling channel, only if it isn't already
+	 * running. Use its own configured bitrate (set independently via
+	 * its netdev, even if not yet opened) instead of hardcoding
+	 * 500000, so we don't clobber a different intended rate. */
+	if (!priv->ch_started[other]) {
+		struct zcan_channel *och = netdev_priv(priv->netdevs[other]);
+		u32 obaud = och->can.bittiming.bitrate ?: 500000;
 
+		zcan_set_baud(priv, other, obaud);
+		zcan_start_channel(priv, other);
+		priv->ch_started[other] = true;
+	}
+
+already_started:
 	ch->can.state = CAN_STATE_ERROR_ACTIVE;
 	netif_start_queue(netdev);
 	dev_info(&priv->udev->dev, "channel %d opened at %u bps\n",
@@ -813,15 +1001,13 @@ static int zcan_netdev_stop(struct net_device *netdev)
 {
 	struct zcan_channel *ch = netdev_priv(netdev);
 	struct zcan_priv *priv = ch->priv;
-	u8 data[4] = { 0x55, 0x80, 0x03, (u8)ch->channel_idx };
-	u8 resp[ZCAN_MAX_PKG_SIZE];
-	int resp_len;
 
 	netif_stop_queue(netdev);
 	ch->can.state = CAN_STATE_STOPPED;
 
 	mutex_lock(&priv->cmd_lock);
-	zcan_cmd(priv, CMD_RESET_CAN, data, sizeof(data), resp, &resp_len);
+	zcan_reset_channel(priv, ch->channel_idx);
+	priv->ch_started[ch->channel_idx] = false;
 	mutex_unlock(&priv->cmd_lock);
 
 	close_candev(netdev);
@@ -832,6 +1018,10 @@ static int zcan_netdev_stop(struct net_device *netdev)
  * do_set_bittiming callback.
  * Skip if the channel is not yet open (called by 'ip link set bitrate'
  * before 'ip link set up'). The correct baud rate is applied during open.
+ *
+ * If the channel is already running, the firmware will not accept a new
+ * SET_BAUD/START_CAN without a preceding CMD_RESET_CAN, so reset and
+ * fully reinitialize it here rather than just poking SET_BAUD.
  */
 static int zcan_set_bittiming(struct net_device *netdev)
 {
@@ -843,8 +1033,16 @@ static int zcan_set_bittiming(struct net_device *netdev)
 		return 0;
 
 	mutex_lock(&priv->cmd_lock);
+	zcan_reset_channel(priv, ch->channel_idx);
+	priv->ch_started[ch->channel_idx] = false;
+
+	zcan_init_channel(priv, ch->channel_idx);
 	ret = zcan_set_baud(priv, ch->channel_idx,
 			    ch->can.bittiming.bitrate);
+	if (!ret)
+		ret = zcan_start_channel(priv, ch->channel_idx);
+	if (!ret)
+		priv->ch_started[ch->channel_idx] = true;
 	mutex_unlock(&priv->cmd_lock);
 	return ret;
 }
@@ -1001,6 +1199,13 @@ static int zcan_probe(struct usb_interface *intf,
 		priv->tx_bufs[i] = buf;
 	}
 
+	ret = device_create_file(&intf->dev, &dev_attr_status_ch0);
+	if (ret)
+		dev_warn(&udev->dev, "sysfs status_ch0 failed: %d\n", ret);
+	ret = device_create_file(&intf->dev, &dev_attr_status_ch1);
+	if (ret)
+		dev_warn(&udev->dev, "sysfs status_ch1 failed: %d\n", ret);
+
 	dev_info(&udev->dev,
 		 "ZCAN USB CANFD connected (%d channels) [v%s]\n",
 		 priv->num_channels, DRIVER_VERSION);
@@ -1024,6 +1229,9 @@ static void zcan_disconnect(struct usb_interface *intf)
 
 	if (!priv)
 		return;
+
+	device_remove_file(&intf->dev, &dev_attr_status_ch1);
+	device_remove_file(&intf->dev, &dev_attr_status_ch0);
 
 	for (i = 0; i < ZCAN_NUM_RX_URBS; i++) {
 		if (priv->rx_urbs[i]) {
