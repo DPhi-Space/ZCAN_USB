@@ -10,3 +10,12 @@
 modules.builtin
 modules.builtin.modinfo
 Module.symvers
+
+# vendor lib / RE workspace and USB captures (large, not source)
+orig/
+*.pcapng
+*.pcap
+
+# Python
+__pycache__/
+*.pyc

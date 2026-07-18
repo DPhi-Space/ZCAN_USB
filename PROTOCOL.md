@@ -259,6 +259,104 @@ magic type  [reserved ]  ID   DLC  [data      ]  [padding             ] txtype [
 
 ---
 
+## CAN FD
+
+Reconstructed by disassembling `GVar::generate_fd_send_frame()` /
+`GVar::generate_send_frame()` in `gvar.o` (`libcontrolcanfd.a`) with
+`objdump`/`nm`, then cross-checked byte-for-byte against a live usbmon
+capture of the vendor's own demo (`orig/main.cpp`, which already exercises
+`ZCAN_TransmitFD`/`ZCAN_ReceiveFD`) with `can0`/`can1` bridged together.
+10/10 captured round trips (5 CH0→CH1, 5 CH1→CH0, IDs 0..9, 64-byte
+payloads) matched this layout exactly, and it has since been confirmed
+working on real hardware via `tools/pingpong_test.py --fd` (2000/2000
+frames, 100% success).
+
+### CMD_TRANSMIT (0x8004) - CAN FD TX Frame
+
+**Direction:** Host → Device via EP1 OUT (CH0) or EP2 OUT (CH1), same as
+classic CAN.
+
+**CAN FD payload (86 bytes):**
+```
+[0]     = 0x55  magic
+[1]     = 0xF2  CAN FD marker (0xF1 = classic CAN)
+[2..3]  = 0x00  reserved
+[4]     = EFF flag (0 = standard, 1 = extended)
+[5]     = RTR flag (0 = data, 1 = remote)
+[6..9]  = CAN ID, big-endian 32-bit, masked to 29 bits
+[10]    = len - actual data byte count 0..64 (NOT a DLC code, unlike the
+          RX side - this is the same value as struct canfd_frame.len)
+[11]    = flags - raw canfd_frame.flags (CANFD_BRS / CANFD_ESI bits)
+[12]    = 0x01  fixed (always 1 in the vendor packer, unconditional)
+[13]    = channel index (0 or 1) - NOTE: different offset than classic
+          CAN, which uses byte[20]
+[14..14+len-1] = CAN FD data
+[81]    = transmit_type (0x00 = normal, auto-retry - same convention as
+          classic CAN)
+```
+All other bytes are 0x00 padding; the payload is always the fixed 86
+bytes regardless of `len` (mirrors classic CAN's fixed 26-byte payload).
+
+**Example** (ID=0x000, len=64, data=00 01 02 ... 3F, channel 0, normal send):
+```
+55 F2 00 00 00 00  00 00 00 00  40 7F 01 00  00 01 02 ... 3F  [zero padding]  00  [zero padding]
+magic type  [rsv]  EFF RTR [ID (32-bit BE)]  len fl  fx  ch   [data (64B)  ]                  txtype
+```
+(`flags`/`transmit_type` in this specific example reflect uninitialized
+fields in the vendor demo's own struct, not a meaningful value - set them
+explicitly when generating real traffic; see `zcan_usb.c`.)
+
+---
+
+## RX Frame Format, CAN FD (EP2 IN / EP3 IN)
+
+Same endpoint routing as classic CAN (EP2 → CH0, EP3 → CH1), raw packets
+without BEEF framing, but a fixed **76-byte** record instead of 21 bytes.
+
+**Frame structure:**
+```
+[0..1]  = flags / partial timestamp (same as classic CAN, undecoded)
+[2..3]  = CAN_ID << 2, little-endian (same decode formula as classic CAN)
+[4..5]  = 0x00 0x00
+[6]     = lower nibble = CAN FD DLC CODE (0..15, translate via the
+          standard CAN FD DLC table: 9→12, 10→16, 11→20, 12→24, 13→32,
+          14→48, 15→64, otherwise code == length); upper nibble = 0x3 in
+          every captured sample (vs. 0x0 for classic CAN) - this is what
+          the driver uses to tell a 21-byte classic record apart from a
+          76-byte CAN FD record when demultiplexing an RX URB. Classic
+          RTR/error frames were never captured, so it is unverified
+          whether their byte[6] upper nibble is also always 0x0.
+[7]     = 0xFF (fixed marker, same as classic CAN)
+[8..8+len-1] = CAN FD data (len from the DLC code above, up to 64)
+[72..75]     = running hardware timestamp counter, little-endian,
+               ticking at roughly 100us per LSB (not decoded by the
+               driver)
+```
+Always a fixed 76-byte record regardless of actual `len`, mirroring both
+the classic CAN 21-byte RX record and the fixed 86-byte CAN FD TX payload.
+
+**Example** (ID=0x001, len=64, data=00 01 02 ... 3F):
+```
+xx xx  04 00  00 00  3F FF  00 01 02 ... 3F  <4-byte timestamp>
+       ↑↑↑↑               ↑↑
+       ID=1 (0x0004>>2)    DLC code=0xF=15 → len=64
+```
+
+### Known limitation: no verified bit-rate-switched (BRS) data phase
+
+INIT_CAN/SET_BAUD are sent identically for CAN FD and classic CAN channels
+(same acc_code/acc_mask/dbit_timing/baud_code, `type=0x01` was already
+required for classic CAN too - see CMD_INIT_CAN above). The capture used
+to reverse-engineer this only exercised CAN FD at the *same* bitrate for
+arbitration and data phase; the vendor demo itself left `abit_timing`
+uninitialized (it differed between the two channels in the capture with no
+correlation to the configured rate), yet 64-byte CAN FD frames still
+transmitted and received correctly end-to-end. No register encoding for a
+genuinely faster, bit-rate-switched data phase has been found or tested.
+The driver requires `dbitrate == bitrate` and rejects anything else.
+
+---
+
 ## RX Frame Format (EP2 IN / EP3 IN)
 
 RX frames arrive as **raw 21-byte packets** without BEEF framing.
@@ -311,3 +409,103 @@ CAN ID calculation: `(0x0444) >> 2 = 0x111` ✓
   `0x01` (single send) causes ~50% packet loss in practice.
 - The `type = 0x01` field in INIT_CAN must always be set to `0x01` even when
   using classic CAN — the device ignores the distinction at the frame level.
+
+---
+
+## Fault Detection
+
+### CMD_GET_STATUS (0x800D)
+
+**Direction:** Host → Device (4 bytes), Device → Host (response)
+
+```
+[0] = 0x55  magic
+[1] = 0x80
+[2] = 0x0D
+[3] = channel index
+```
+
+This command was long marked unverified in this project (its opcode came
+from a dead DWARF enumerator, not from any observed traffic - see the
+`CMD_GET_STATUS` note in `zcan_usb.c`). It **is** real: the device returns
+a well-formed 64-byte BEEF-framed response, and the request's `[3]`
+channel-index byte turns out **not to matter** - the response always
+contains status for both channels, back to back:
+
+```
+data[0..11]  = CH0 status block
+data[12..23] = CH1 status block
+```
+
+**This per-channel-block structure was initially missed**: an early
+empirical pass only ever induced a fault on CH0 and (wrongly) assumed a
+single fixed response offset applied to both channels; a follow-up test
+that induced the fault on CH1 instead showed the exact same signal 12
+bytes further into the response, confirming the block layout above. The
+driver originally always inspected only the CH0 block regardless of which
+channel it was actually checking - meaning `zcan_status_poll()` never
+detected CH1 faults at all until this was fixed.
+
+Within each 12-byte block, relative byte 6 has a confirmed meaning:
+
+```
+block[6] = 0x00   while that channel's frames are actually reaching the
+                   bus (idle or actively transmitting/receiving without
+                   errors)
+block[6] = 0x80   while that channel's transmission is reliably failing
+                   (confirmed by disconnecting the physical bridge
+                   between two bridged channels and hammering TX with
+                   tools/pingpong_test.py - reproduced independently for
+                   both CH0 and CH1)
+```
+
+i.e. `data[6]` for CH0's fault state, `data[18]` for CH1's. Confirmed
+across three independent test runs by sampling the `status_ch0`/
+`status_ch1` sysfs attributes every 0.5s: the fault byte was *never*
+observed to be anything other than exactly `0x00` or exactly `0x80` - no
+intermediate values, no other bits set alongside bit 7. It takes roughly
+2 seconds of continuously failing sends for it to flip from `0x00` to
+`0x80`, consistent with an internal error count that needs to accumulate
+before crossing some threshold, rather than a per-frame result. After
+reconnecting the physical bus, it moves away from `0x80` (observed as
+`0x4c` in one capture) but does not reliably settle back to a clean
+`0x00` on its own - a full reset+reinit (`CMD_RESET_CAN` + `CMD_INIT_CAN`
++ `CMD_SET_BAUD` + `CMD_START_CAN`, i.e. the same sequence a manual
+`ip link down`/`up` triggers) was required to actually restore
+transmission, which is what `zcan_usb.c`'s periodic `zcan_status_poll()`
+now automates.
+
+Whether this represents genuine ISO 11898-1 bus-off or a firmware-internal
+"gave up retrying" flag tied to `transmit_type = 0x00` (auto-retry mode)
+could not be determined - both would produce exactly this observed
+behavior, and telling them apart isn't possible from the host side
+without lower-level access to the CAN controller.
+
+The rest of each block (bytes other than relative offset 6) looks like it
+may carry status/error-counter-like fields (relative offset 10 was seen
+at `0x0f` idle, fluctuating `0x08`-`0x18` during real healthy traffic, and
+pinned at `0x7b` throughout the fault condition) but is **not decoded or
+relied on** - it did not behave like a live, continuously-incrementing
+counter in testing (it jumps to a value and then stays constant for many
+consecutive samples despite continued TX attempts), and there is no
+vendor reference for it: `libcontrolcanfd.a`/`.so` was checked in full
+(disassembly of every object file, plus the complete exported `.so`
+symbol table) for any function that reads back a real error count/rate,
+and there isn't one. `CMD_GET_STATUS` is never issued anywhere in the
+vendor's own compiled code, and the generic `IProperty` config-tree
+interface it exposes (`GetValue`/`SetValue`/`GetPropertys`, normally how
+ZLG-derived devices expose things like error info or bus usage) has
+`GetPropertys()` implemented as a stub that unconditionally returns 0.
+
+### Driver behavior
+
+`zcan_usb.c` polls `CMD_GET_STATUS` once per second (a single query
+covers both channels, see above) while at least one channel is up. For
+each running channel, when its block's fault byte reads `0x80`:
+- The channel is flagged internally so `ndo_start_xmit` counts subsequent
+  frames as `tx_errors` instead of `tx_packets` (a driver-side
+  approximation for visibility via `ip -details -statistics link show`,
+  not a real per-frame result - see above).
+- The reset+reinit sequence is re-applied automatically for that channel,
+  so it recovers on its own once the underlying physical issue is
+  actually fixed, without requiring a manual `down`/`up`.
