@@ -1213,7 +1213,14 @@ static void zcan_build_can_tx(u8 *tx_data, u8 ch_idx, struct can_frame *cf)
 	tx_data[TX_CAN_ID_OFFSET]       = (can_id >>  8) & 0xff;
 	tx_data[TX_CAN_ID_OFFSET + 1]   =  can_id        & 0xff;
 	tx_data[TX_CAN_DLC_OFFSET] = dlc;
-	memcpy(tx_data + TX_CAN_DATA_OFFSET, cf->data, dlc);
+	/*
+	 * A remote frame carries no data - it requests dlc bytes from the
+	 * remote node. struct can_frame.data is undefined for an RTR skb, so
+	 * copying it here would put uninitialised kernel memory into the USB
+	 * payload; leave the (already zeroed) data field alone instead.
+	 */
+	if (!rtr)
+		memcpy(tx_data + TX_CAN_DATA_OFFSET, cf->data, dlc);
 	tx_data[TX_CAN_CH_OFFSET] = ch_idx;
 	tx_data[TX_CAN_TXTYPE_OFFSET] = 0x00;	/* normal, auto-retry */
 }
