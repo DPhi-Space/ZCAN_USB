@@ -263,8 +263,7 @@
 #define TX_FD_TXTYPE_OFFSET	81
 
 /* RX frame layout (raw, 21 bytes, no BEEF wrapper):
- *  [0..1]  = flags / partial timestamp
- *  [2..3]  = CAN_ID << 2, little-endian → CAN_ID = ([3]<<8 | [2]) >> 2
+ *  [0..3]  = arbitration word, little-endian 32-bit (see below)
  *  [4..5]  = 0x00 0x00
  *  [6]     = lower nibble = DLC
  *  [7]     = 0xFF (fixed)
@@ -276,11 +275,33 @@
 #define RX_DATA_OFFSET		8
 
 /*
+ * RX arbitration word at [0..3], little-endian 32-bit. This is the raw CAN
+ * arbitration field as the controller latched it, not a packed CAN ID:
+ *
+ *   bits  0..28 = identifier
+ *   bit      30 = IDE (1 = extended/29-bit frame, 0 = standard/11-bit)
+ *
+ * Because a 29-bit extended identifier is defined by ISO 11898-1 as an
+ * 11-bit *base* ID followed by an 18-bit extension, the 11-bit ID of a
+ * standard frame lands at bits 18..28 - NOT at bits 0..10. That is why the
+ * standard-frame decode needs a >> 18, and why bytes [0..1] (previously
+ * documented here as "flags / partial timestamp") are in fact the low 18
+ * bits of an extended identifier.
+ *
+ * Worked example, standard ID 0x111, from the capture in PROTOCOL.md:
+ *   [0..3] = 00 00 44 04 → 0x04440000 → >> 18 = 0x111 ✓
+ * which is exactly what the previous ([3]<<8 | [2]) >> 2 formula computed,
+ * so standard-frame decoding is unchanged by this.
+ */
+#define RX_ID_IDE_FLAG		BIT(30)	/* extended (29-bit) frame */
+#define RX_ID_SFF_SHIFT		18	/* base ID sits at bits 18..28 */
+
+/*
  * RX frame layout (raw, 76 bytes, no BEEF wrapper), reconstructed from a
  * live usbmon capture (zcan_dump.pcapng) of ZCAN_ReceiveFD() with both
  * channels bridged - 5 round trips each direction, IDs 0..9:
- *  [0..1]  = flags / partial timestamp (same as classic, undecoded)
- *  [2..3]  = CAN_ID << 2, little-endian (same formula as classic)
+ *  [0..3]  = arbitration word, little-endian 32-bit (same as classic, see
+ *            the RX_ID_IDE_FLAG comment above)
  *  [4..5]  = 0x00 0x00
  *  [6]     = lower nibble = CAN FD DLC CODE (0..15, use can_fd_dlc2len()),
  *            upper nibble = 0x3 in every captured sample (vs. 0x0 for
@@ -950,11 +971,31 @@ static DEVICE_ATTR_RO(status_ch1);
  */
 
 /*
+ * Decode the SocketCAN identifier (including CAN_EFF_FLAG) from the 4-byte
+ * arbitration word at the head of an RX record. Shared by the classic and
+ * CAN FD RX paths - both records carry the identical field, see the
+ * RX_ID_IDE_FLAG comment above for the layout and how it was derived.
+ *
+ * The bytes are assembled by hand rather than with get_unaligned_le32() so
+ * that this builds unmodified across the whole supported kernel range (the
+ * header moved from <asm/unaligned.h> to <linux/unaligned.h> in 6.12).
+ */
+static canid_t zcan_rx_decode_id(const u8 *buf)
+{
+	u32 raw = (u32)buf[0] | ((u32)buf[1] << 8) |
+		  ((u32)buf[2] << 16) | ((u32)buf[3] << 24);
+
+	if (raw & RX_ID_IDE_FLAG)
+		return (raw & CAN_EFF_MASK) | CAN_EFF_FLAG;
+
+	return (raw >> RX_ID_SFF_SHIFT) & CAN_SFF_MASK;
+}
+
+/*
  * Parse a received CAN frame from a 21-byte raw RX packet.
  *
  * RX frame format (verified from live USB captures, fw=0x0200 hw=0x0212):
- *  [0..1]  = flags / partial timestamp
- *  [2..3]  = CAN_ID << 2, little-endian
+ *  [0..3]  = arbitration word, little-endian (see RX_ID_IDE_FLAG above)
  *  [4..5]  = 0x00 0x00
  *  [6]     = lower nibble = DLC  (NOT upper nibble)
  *  [7]     = 0xFF (fixed marker)
@@ -969,14 +1010,12 @@ static void zcan_rx_frame(struct zcan_channel *ch, const u8 *buf, int len)
 	struct net_device *netdev = ch->netdev;
 	struct can_frame *cf;
 	struct sk_buff *skb;
-	u32 can_id;
 	u8 dlc;
 
 	if (len < 9)
 		return;
 
-	can_id = (((u32)buf[3] << 8) | buf[2]) >> 2;
-	dlc    = buf[RX_DLC_OFFSET] & 0x0f;
+	dlc = buf[RX_DLC_OFFSET] & 0x0f;
 
 	if (dlc > 8)
 		dlc = 8;
@@ -985,7 +1024,7 @@ static void zcan_rx_frame(struct zcan_channel *ch, const u8 *buf, int len)
 	if (!skb)
 		return;
 
-	cf->can_id  = can_id & CAN_SFF_MASK;
+	cf->can_id  = zcan_rx_decode_id(buf);
 	cf->can_dlc = dlc;
 	if (len >= RX_DATA_OFFSET + (int)dlc)
 		memcpy(cf->data, buf + RX_DATA_OFFSET, dlc);
@@ -1004,13 +1043,11 @@ static void zcan_rx_canfd_frame(struct zcan_channel *ch, const u8 *buf, int len)
 	struct net_device *netdev = ch->netdev;
 	struct canfd_frame *cf;
 	struct sk_buff *skb;
-	u32 can_id;
 	u8 dlc_code, dlen;
 
 	if (len < RX_DATA_OFFSET + 1)
 		return;
 
-	can_id = (((u32)buf[3] << 8) | buf[2]) >> 2;
 	dlc_code = buf[RX_DLC_OFFSET] & 0x0f;
 	dlen = can_fd_dlc2len(dlc_code);
 	if (dlen > CANFD_MAX_DLEN)
@@ -1020,7 +1057,7 @@ static void zcan_rx_canfd_frame(struct zcan_channel *ch, const u8 *buf, int len)
 	if (!skb)
 		return;
 
-	cf->can_id = can_id & CAN_SFF_MASK;
+	cf->can_id = zcan_rx_decode_id(buf);
 	cf->len    = dlen;
 	if (len >= RX_DATA_OFFSET + (int)dlen)
 		memcpy(cf->data, buf + RX_DATA_OFFSET, dlen);
