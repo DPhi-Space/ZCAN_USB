@@ -38,8 +38,12 @@ kernel driver. This driver exposes the device as standard SocketCAN interfaces
 sudo pacman -S linux-headers can-utils
 
 # Ubuntu / Debian
-sudo apt install linux-headers-$(uname -r) can-utils
+sudo apt install linux-headers-$(uname -r) linux-modules-extra-$(uname -r) can-utils
 ```
+
+> On Ubuntu, `can-dev` lives in `linux-modules-extra`, which is not installed
+> by default on cloud/minimal images — without it `insmod` fails with
+> unknown-symbol errors for `alloc_candev`, `open_candev` and friends.
 
 ---
 
@@ -51,8 +55,17 @@ sudo apt install linux-headers-$(uname -r) can-utils
 git clone https://github.com/youruser/zcan_usb
 cd zcan_usb
 make
+sudo modprobe can_dev
 sudo insmod zcan_usb.ko
 ```
+
+> After a kernel upgrade, a manual (non-DKMS) build needs the headers and
+> modules for the *new* kernel before it will build and load again:
+>
+> ```bash
+> sudo apt install --reinstall linux-headers-$(uname -r) linux-modules-extra-$(uname -r)
+> sudo reboot
+> ```
 
 ### DKMS (survives kernel updates)
 
