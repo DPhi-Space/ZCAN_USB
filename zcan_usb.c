@@ -89,7 +89,7 @@
  *  - Given that, netdev->stats.tx_errors/tx_packets accounting below is a
  *    driver-synthesized approximation, NOT a real hardware error count:
  *    while a channel's fault byte reads ZCAN_STATUS_FAULT_VALUE, every
- *    frame handed to that channel's ndo_start_xmit is counted as
+ *    frame whose TX URB completes on that channel is counted as
  *    tx_errors instead of tx_packets (the USB transfer itself still
  *    completes normally - we have no way to know if any individual frame
  *    actually reached the bus). See zcan_status_poll().
@@ -153,8 +153,8 @@
  * ZCAN_CHANNEL_STATUS/ZCAN_CHANNEL_ERR_INFO (regTECounter, regRECounter,
  * bus-off etc.) - exactly the kind of real controller error state this
  * device's netdev stats cannot provide (see zcan_netdev_xmit/zcan_tx_complete:
- * tx_packets is incremented as soon as the USB URB is handed off, with no
- * feedback on whether the frame was ever ACKed on the physical bus).
+ * tx_packets is incremented when the USB URB completes, with no feedback
+ * on whether the frame was ever ACKed on the physical bus).
  *
  * However, the SAME enum's CMD_RESET_CAN = 0x8009 does NOT match the value
  * verified for this actual device via live USB capture (0x8008, see
@@ -1142,9 +1142,28 @@ static void zcan_tx_complete(struct urb *urb)
 	struct net_device *netdev = urb->context;
 	struct zcan_channel *ch = netdev_priv(netdev);
 	struct zcan_priv *priv = ch->priv;
+	unsigned int dlen;
 
-	if (urb->status)
+	if (urb->status) {
 		netdev->stats.tx_errors++;
+		can_free_echo_skb(netdev, 0, NULL);
+	} else {
+		/*
+		 * Loop the frame back to SocketCAN and account it. The echo
+		 * is unconditional on a successful URB: ch_fault is a coarse,
+		 * polled approximation (see the file header) and must not be
+		 * allowed to swallow an application's view of its own sends.
+		 * Only the counter it lands in reflects the fault state.
+		 */
+		dlen = can_get_echo_skb(netdev, 0, NULL);
+
+		if (priv->ch_fault[ch->channel_idx]) {
+			netdev->stats.tx_errors++;
+		} else {
+			netdev->stats.tx_packets++;
+			netdev->stats.tx_bytes += dlen;
+		}
+	}
 
 	atomic_set(&priv->tx_active[ch->channel_idx], 0);
 	netif_wake_queue(netdev);
@@ -1177,7 +1196,7 @@ static void zcan_tx_complete(struct urb *urb)
  * SFF case) - extended (29-bit) classic CAN IDs were previously silently
  * truncated to their low 16 bits since [6..7] was never written.
  */
-static int zcan_build_can_tx(u8 *tx_data, u8 ch_idx, struct can_frame *cf)
+static void zcan_build_can_tx(u8 *tx_data, u8 ch_idx, struct can_frame *cf)
 {
 	u32 can_id = cf->can_id & CAN_ERR_MASK;
 	bool eff = cf->can_id & CAN_EFF_FLAG;
@@ -1197,15 +1216,13 @@ static int zcan_build_can_tx(u8 *tx_data, u8 ch_idx, struct can_frame *cf)
 	memcpy(tx_data + TX_CAN_DATA_OFFSET, cf->data, dlc);
 	tx_data[TX_CAN_CH_OFFSET] = ch_idx;
 	tx_data[TX_CAN_TXTYPE_OFFSET] = 0x00;	/* normal, auto-retry */
-
-	return dlc;
 }
 
 /*
  * Build a CAN FD TX payload (86 bytes). See TX_CANFD_PAYLOAD_LEN comment
  * above for the format and how it was reconstructed.
  */
-static int zcan_build_canfd_tx(u8 *tx_data, u8 ch_idx, struct canfd_frame *cf)
+static void zcan_build_canfd_tx(u8 *tx_data, u8 ch_idx, struct canfd_frame *cf)
 {
 	u32 can_id = cf->can_id & CAN_ERR_MASK;
 	bool eff = cf->can_id & CAN_EFF_FLAG;
@@ -1227,8 +1244,6 @@ static int zcan_build_canfd_tx(u8 *tx_data, u8 ch_idx, struct canfd_frame *cf)
 	tx_data[TX_FD_CH_OFFSET]    = ch_idx;
 	memcpy(tx_data + TX_FD_DATA_OFFSET, cf->data, len);
 	tx_data[TX_FD_TXTYPE_OFFSET] = 0x00;	/* normal, auto-retry */
-
-	return len;
 }
 
 static netdev_tx_t zcan_netdev_xmit(struct sk_buff *skb,
@@ -1239,7 +1254,7 @@ static netdev_tx_t zcan_netdev_xmit(struct sk_buff *skb,
 	int ch_idx = ch->channel_idx;
 	u8 tx_data[TX_CANFD_PAYLOAD_LEN];
 	bool is_fd = can_is_canfd_skb(skb);
-	int dlc, pkt_len, payload_len;
+	int pkt_len, payload_len;
 	unsigned int ep_out;
 
 	if (can_dev_dropped_skb(netdev, skb))
@@ -1251,12 +1266,12 @@ static netdev_tx_t zcan_netdev_xmit(struct sk_buff *skb,
 	}
 
 	if (is_fd) {
-		dlc = zcan_build_canfd_tx(tx_data, (u8)ch_idx,
-					  (struct canfd_frame *)skb->data);
+		zcan_build_canfd_tx(tx_data, (u8)ch_idx,
+				    (struct canfd_frame *)skb->data);
 		payload_len = TX_CANFD_PAYLOAD_LEN;
 	} else {
-		dlc = zcan_build_can_tx(tx_data, (u8)ch_idx,
-					(struct can_frame *)skb->data);
+		zcan_build_can_tx(tx_data, (u8)ch_idx,
+				  (struct can_frame *)skb->data);
 		payload_len = TX_CAN_PAYLOAD_LEN;
 	}
 
@@ -1269,28 +1284,34 @@ static netdev_tx_t zcan_netdev_xmit(struct sk_buff *skb,
 			  priv->tx_bufs[ch_idx], pkt_len,
 			  zcan_tx_complete, netdev);
 
+	/*
+	 * Hand the skb to the CAN echo buffer instead of freeing it. This
+	 * netdev sets IFF_ECHO, which tells the CAN core the driver performs
+	 * the local echo itself - so without this, frames sent from this host
+	 * are never looped back and candump/python-can on the sending
+	 * interface see nothing at all of their own traffic.
+	 *
+	 * This must happen before usb_submit_urb(): the completion handler
+	 * can run the moment the URB is submitted, and it is what delivers
+	 * (or, on failure, drops) the echo skb. The echo buffer holds a
+	 * single entry, which matches the one-TX-in-flight tx_active guard
+	 * above, so slot 0 is always free here.
+	 */
+	can_put_echo_skb(skb, netdev, 0, 0);
+
 	if (usb_submit_urb(priv->tx_urbs[ch_idx], GFP_ATOMIC)) {
+		can_free_echo_skb(netdev, 0, NULL);
 		netdev->stats.tx_errors++;
 		atomic_set(&priv->tx_active[ch_idx], 0);
-		dev_kfree_skb(skb);
 		return NETDEV_TX_OK;
 	}
 
 	/*
-	 * The USB transfer itself always succeeds here regardless of whether
-	 * the frame ever reaches the physical bus - see the "Fault detection
-	 * / recovery" note in the file header. While zcan_status_poll() has
-	 * this channel flagged faulty, count frames as tx_errors instead of
-	 * tx_packets; this is a driver-side approximation, not a real
-	 * per-frame ACK/error result.
+	 * tx_packets/tx_bytes are accounted in zcan_tx_complete() now that
+	 * the skb outlives this function. Note that a completed URB still
+	 * says nothing about whether the frame reached the physical bus -
+	 * see the "Fault detection / recovery" note in the file header.
 	 */
-	if (priv->ch_fault[ch_idx]) {
-		netdev->stats.tx_errors++;
-	} else {
-		netdev->stats.tx_packets++;
-		netdev->stats.tx_bytes += dlc;
-	}
-	dev_kfree_skb(skb);
 	return NETDEV_TX_OK;
 }
 
