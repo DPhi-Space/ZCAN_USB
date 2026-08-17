@@ -17,7 +17,8 @@
  *  - TX payload is 26 bytes for classic CAN, 86 bytes for CANFD, BEEF-wrapped
  *  - RX frames arrive as raw packets on EP2/EP3: 21 bytes (classic CAN) or
  *    76 bytes (CANFD), no BEEF wrapper
- *  - Both channels must be initialized for stable RX after TX
+ *  - A channel must be INIT_CAN'd twice before it reports RX frame
+ *    headers; a single INIT yields records with id == 0 and dlc == 0
  *
  * CAN FD support (added in 0.8.0):
  *  - The 86-byte TX payload layout was reconstructed byte-exact from
@@ -1334,10 +1335,15 @@ static netdev_tx_t zcan_netdev_xmit(struct sk_buff *skb,
  * (verified from USB captures):
  *   INIT CH0 → INIT CH1 → BAUD CH0 → START CH0 → BAUD CH1 → START CH1
  *
- * Both channels must be initialized even when only one is used, since
- * without CH1 init, EP3 stays silent and the device stops delivering
- * RX frames after a TX is performed. However, this sibling-channel
- * setup must only happen once: if the sibling is already running
+ * The sibling channel is initialized here as well, matching the vendor
+ * library. Note that this is NOT what makes RX work - that requires the
+ * second INIT_CAN + START_CAN on the channel being opened (see the
+ * comment on it below). Measured on a 1 Mbit bus: opening can0 alone
+ * with the sibling setup present but only one INIT yields 33 usable
+ * frames in 8 s, while a second INIT with no sibling commands at all
+ * yields 878.
+ *
+ * The sibling setup must only happen once: if the sibling is already running
  * (opened independently, e.g. "ip link set can0 up" followed later by
  * "ip link set can1 up"), re-sending INIT/BAUD/START to it here would
  * silently reset its bitrate to the hardcoded default and restart an
@@ -1392,6 +1398,24 @@ static int zcan_netdev_open(struct net_device *netdev)
 	ret = zcan_start_channel(priv, ch->channel_idx);
 	if (ret) {
 		dev_err(&priv->udev->dev, "START_CAN ch%d failed: %d\n",
+			ch->channel_idx, ret);
+		goto out;
+	}
+
+	/* The device only starts filling in the RX arbitration word and DLC
+	 * once a channel has been INIT_CAN'd a second time while already
+	 * running. After a single INIT_CAN/START_CAN the frame payloads do
+	 * arrive on the bulk IN endpoint, but every record carries id == 0
+	 * and dlc == 0, so the null-record check in zcan_rx_complete()
+	 * discards them and the interface looks dead. Repeating INIT_CAN +
+	 * START_CAN here, with no CMD_RESET_CAN in between, is what makes RX
+	 * work; a CMD_RESET_CAN puts the channel back into the state that
+	 * needs two INITs again.
+	 */
+	zcan_init_channel(priv, ch->channel_idx);
+	ret = zcan_start_channel(priv, ch->channel_idx);
+	if (ret) {
+		dev_err(&priv->udev->dev, "START_CAN ch%d (2nd) failed: %d\n",
 			ch->channel_idx, ret);
 		goto out;
 	}

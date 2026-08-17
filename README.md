@@ -205,8 +205,12 @@ The driver was reverse-engineered using:
 Key findings that were non-obvious:
 - The device sends 2-byte polling packets on EP1 IN every ~16ms; these must
   be discarded when waiting for command responses
-- Both channels must be initialized (INIT+BAUD+START) even when only one is
-  used, or RX stops after TX
+- A channel must be sent `INIT_CAN` **twice** — the second time while it is
+  already started, with no `CMD_RESET_CAN` in between — before the device
+  populates the RX arbitration word and DLC. With only one `INIT_CAN` the
+  payload bytes still arrive on the bulk IN endpoint, but every record has
+  `id == 0` and `dlc == 0` and is discarded as a null record, so the
+  interface looks dead
 - TX frames use `0xF1` marker (classic CAN) or `0xF2` (CAN FD), with a
   26-byte payload for classic CAN and an 86-byte payload for CAN FD
 - `transmit_type = 0x00` (auto-retry) is required; `0x01` causes ~50% packet
