@@ -21,7 +21,7 @@ kernel driver. This driver exposes the device as standard SocketCAN interfaces
 - Two independent CAN channels (`can0` / `can1`)
 - Classic CAN (up to 1 Mbit/s)
 - CAN FD (up to 64-byte payload), verified end-to-end on real hardware;
-  bit-rate switching up to 5 Mbit/s, not yet tested on hardware, see
+  bit-rate switching up to 5 Mbit/s, tested at 2, 4 and 5 Mbit/s, see
   [CAN FD](#can-fd) below
 - Standard SocketCAN interface — works with `can-utils`, `python-can`, etc.
 - Automatic DKMS support for kernel updates
@@ -150,6 +150,13 @@ says. See [PROTOCOL.md](PROTOCOL.md#data-phase-timing-bit-rate-switching).
 Tested with `tools/pingpong_test.py --fd --fd-len 64` bridging `can0` and
 `can1` on real hardware: 2000/2000 frames round-tripped correctly (100%
 success, 0 CRC/counter errors, ~1.8 ms average RTT at 500 kbit/s).
+
+Bit-rate switching was tested point-to-point against a TCAN4550 node at
+1 Mbit/s nominal and 2, 4 and 5 Mbit/s data, in both directions. Frames
+received from the node carry `CANFD_BRS`, and a dbitrate that differs from
+the node's gets no frames through. At 4 and 5 Mbit/s the node saw
+data-phase errors on about one frame in ten, which CAN retransmitted. The
+cause is not traced yet, and termination is the first suspect.
 
 ---
 
