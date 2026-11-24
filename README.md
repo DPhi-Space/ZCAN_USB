@@ -20,8 +20,9 @@ kernel driver. This driver exposes the device as standard SocketCAN interfaces
 
 - Two independent CAN channels (`can0` / `can1`)
 - Classic CAN (up to 1 Mbit/s)
-- CAN FD (up to 64-byte payload), verified end-to-end on real hardware -
-  see [CAN FD](#can-fd) below for the current limitation
+- CAN FD (up to 64-byte payload), verified end-to-end on real hardware;
+  bit-rate switching up to 5 Mbit/s, not yet tested on hardware, see
+  [CAN FD](#can-fd) below
 - Standard SocketCAN interface — works with `can-utils`, `python-can`, etc.
 - Automatic DKMS support for kernel updates
 
@@ -135,12 +136,16 @@ sudo ip link set can0 up
 cansend can0 123##1AABBCCDDEEFF00112233445566778899001122334455667788990011223344556677889900112233
 ```
 
-**Known limitation:** the CAN FD implementation was reverse-engineered from
-a live USB capture in which the vendor's own demo only ever ran the data
-phase at the *same* bitrate as arbitration - no register encoding for a
-genuinely faster, bit-rate-switched (BRS) data phase has been found or
-tested. The driver enforces `dbitrate == bitrate`; anything else is
-rejected by `do_set_data_bittiming()`. Real BRS operation is unverified.
+With bit-rate switching (1 Mbit/s nominal, 4 Mbit/s data):
+
+```bash
+sudo ip link set can0 type can bitrate 1000000 dbitrate 4000000 fd on
+```
+
+The data phase can only use the rates in `zcan_dbit_table` (100 kbit/s to
+5 Mbit/s, from the vendor library). Any other dbitrate is rejected. The
+device runs the vendor sample point for that rate, whatever `dsample-point`
+says. See [PROTOCOL.md](PROTOCOL.md#data-phase-timing-bit-rate-switching).
 
 Tested with `tools/pingpong_test.py --fd --fd-len 64` bridging `can0` and
 `can1` on real hardware: 2000/2000 frames round-tripped correctly (100%
