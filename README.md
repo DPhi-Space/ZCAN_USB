@@ -151,12 +151,18 @@ Tested with `tools/pingpong_test.py --fd --fd-len 64` bridging `can0` and
 `can1` on real hardware: 2000/2000 frames round-tripped correctly (100%
 success, 0 CRC/counter errors, ~1.8 ms average RTT at 500 kbit/s).
 
-Bit-rate switching was tested point-to-point against a TCAN4550 node at
-1 Mbit/s nominal and 2, 4 and 5 Mbit/s data, in both directions. Frames
-received from the node carry `CANFD_BRS`, and a dbitrate that differs from
-the node's gets no frames through. At 4 and 5 Mbit/s the node saw
-data-phase errors on about one frame in ten, which CAN retransmitted. The
-cause is not traced yet, and termination is the first suspect.
+Bit-rate switching was tested point-to-point against a TCAN4550 node, in
+both directions: 1 Mbit/s nominal with 2, 4 and 5 Mbit/s data, and
+500 kbit/s nominal with 500 kbit/s and 2 Mbit/s data. Frames received
+from the node carry `CANFD_BRS`, and a dbitrate that differs from the
+node's gets no frames through.
+
+At 4 and 5 Mbit/s the adapter rejected about one frame in ten from the
+node, and CAN retransmitted them. Of 5000 frames the other way, at most 3
+had an error. Moving the node's transmitter delay compensation offset did
+not change the rate. The wiring was short, correctly terminated and
+grounded, but not twisted, so the cause is not settled. 2 Mbit/s ran
+clean.
 
 ---
 
