@@ -36,9 +36,9 @@
  *  - Bit-rate switching: ZCAN_InitCAN() in libcontrolcanfd sends the
  *    ZCAN_SetAbitBaud() code at INIT_CAN [18..21] and the
  *    ZCAN_SetDbitBaud() code at [22..25], which the capture had as the
- *    fixed bytes 03 01 0a 02 (the 1 Mbit/s data row). A dbitrate other
- *    than the nominal one sends its row of zcan_dbit_table; a dbitrate
- *    equal to it keeps those fixed bytes.
+ *    fixed bytes 03 01 0a 02 (the 1 Mbit/s data row). A CAN FD channel
+ *    sends the row of zcan_dbit_table for its dbitrate; a classic channel
+ *    keeps those fixed bytes.
  *  - RX record framing (21 vs 76 bytes) is distinguished by the upper
  *    nibble of byte[6] (0x00 = classic, non-zero = CANFD carrying the DLC
  *    code) - confirmed consistently across all 10 captured RX frames, but
@@ -744,18 +744,17 @@ static u32 zcan_dbit_lookup(u32 dbitrate)
 }
 
 /*
- * Without bit-rate switching configured this is ZCAN_DBIT_DEFAULT, the value
- * the driver has always sent, even when the nominal rate is not 1 Mbit/s.
+ * The row for the dbitrate, also when it equals the nominal bitrate: a frame
+ * sent with CANFD_BRS runs its data phase at this rate. A classic channel
+ * sends ZCAN_DBIT_DEFAULT, the value the driver has always sent.
  */
 static u32 zcan_dbit_timing(const struct zcan_channel *zch)
 {
-	u32 dbitrate = ZCAN_FD(&zch->can).data_bittiming.bitrate;
 	u32 dbit;
 
-	if (!(zch->can.ctrlmode & CAN_CTRLMODE_FD) ||
-	    dbitrate == zch->can.bittiming.bitrate)
+	if (!(zch->can.ctrlmode & CAN_CTRLMODE_FD))
 		return ZCAN_DBIT_DEFAULT;
-	dbit = zcan_dbit_lookup(dbitrate);
+	dbit = zcan_dbit_lookup(ZCAN_FD(&zch->can).data_bittiming.bitrate);
 	return dbit ?: ZCAN_DBIT_DEFAULT;
 }
 
@@ -1589,7 +1588,7 @@ static int zcan_set_data_bittiming(struct net_device *netdev)
 	struct zcan_channel *ch = netdev_priv(netdev);
 	u32 dbitrate = ZCAN_FD(&ch->can).data_bittiming.bitrate;
 
-	if (dbitrate != ch->can.bittiming.bitrate && !zcan_dbit_lookup(dbitrate)) {
+	if (!zcan_dbit_lookup(dbitrate)) {
 		netdev_err(netdev, "dbitrate %u not supported by the device\n",
 			   dbitrate);
 		return -EINVAL;

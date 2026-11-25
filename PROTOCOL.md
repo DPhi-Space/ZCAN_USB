@@ -364,8 +364,8 @@ device's clock is 60 MHz, not the 80 MHz the driver reports.
 
 `zcan_dbit_table` in `zcan_usb.c` holds the full table. The fixed bytes
 `03 01 0A 02` that earlier captures showed at `[22..25]` are the 1 Mbit/s
-row. The driver keeps sending them when `dbitrate == bitrate`. Other
-dbitrates send their own row.
+row. A classic channel still sends them. A CAN FD channel sends the row
+of its dbitrate, also when that equals the nominal bitrate.
 
 In an RX record, `[6]` bit 5 marks CAN FD and bit 4 marks BRS. This is how
 the vendor library decodes it.
